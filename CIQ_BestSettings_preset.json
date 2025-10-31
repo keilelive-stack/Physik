@@ -1,0 +1,24 @@
+{
+  "u_control_input": 0.5,
+  "tus": {
+    "enabled": true,
+    "mode": "sine",
+    "amp": 0.015,
+    "freq_mhz": 0.0005,
+    "width": 0.02
+  },
+  "sim": {
+    "time": 10.0,
+    "steps": 1000,
+    "seed": 42
+  },
+  "delta_clip": {
+    "min": 0.66,
+    "max": 0.74
+  },
+  "bic": {
+    "baseline": 251.776,
+    "penalty": 5500.0
+  },
+  "resonance_window": 0.015
+}
