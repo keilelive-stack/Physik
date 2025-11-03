@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CIQ Ultimate Simulator v266+ — AI Core (CSV-driven, self-learning, CPU)
+======================================================================
+- Liest automatisch jede Simulation-CSV ein (Spalten werden dynamisch erkannt)
+- Erkennt Zeitspalte (falls vorhanden) und inferiert Frequenz
+- Skaliert numerische Spalten automatisch (Mean/Std), speichert Skalierer
+- Trainiert ein Multi-Output-Zeitreihenmodell (LSTM, falls torch verfügbar; sonst NumPy-MLP Fallback)
+- Gibt Mehrschritt-Vorhersagen (für ALLE numerischen Spalten) aus
+- Speichert Modellgewichte, Logs, Plots und Feedback (Δ≈0.7 Heuristik für phi_super/phi_orch, falls vorhanden)
+
+Usage (Beispiele):
+    python ciq_ultimate_simulator_v266_ai.py --csv simulation.csv --horizon 60
+    python ciq_ultimate_simulator_v266_ai.py --csv /path/to/sim.csv --seq_len 64 --epochs 200 --outdir ai_out
+
+Erwartete CSV:
+    - Beliebige Spaltennamen sind erlaubt; das Skript wählt automatisch alle NUMERISCHEN Spalten als Targets.
+    - Optional: eine Zeitspalte (z.B. "date", "time", "timestamp"). Wenn keine gefunden wird, wird ein Integer-Index genutzt.
+
+Ausgabe (Default: ./ai_out/):
+    - forecast.csv                # Vorhersage für alle numerischen Spalten (H Zeitschritte)
+    - ciq_ai_model.pt/.npz        # Modellgewichte (torch oder numpy-fallback)
+    - scaler.json                 # Means/Std je Spalte
+    - ciq_ai_log.json             # Loss/Metadata
+    - feedback.json               # Δ≈0.7 Feedback (falls phi_orch & phi_super vorhanden)
+    - plots/forecast_<col>.png    # je numerischer Spalte ein Plot (History + Forecast)
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --- Optional: PyTorch (CPU); we handle absence with a safe NumPy fallback ---
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+RNG = np.random.default_rng(42)
+
+
+# ------------------------------
+# I/O + Column Inference
+# ------------------------------
+def load_csv_auto(path: str) -> pd.DataFrame:
+    """Read CSV with robust date inference and dynamic numeric column selection."""
+    df = pd.read_csv(path)
+    # try to find a time-like column
+    time_candidates = [c for c in df.columns if c.lower() in ("date", "time", "timestamp", "datetime")]
+    time_col = None
+    parse_success = {}
+    for c in df.columns:
+        try:
+            parsed = pd.to_datetime(df[c], errors="coerce", utc=False)
+            valid = parsed.notna().mean()
+            parse_success[c] = valid
+        except Exception:
+            parse_success[c] = 0.0
+
+    # pick best explicit candidate if parses well; else best overall
+    best_col = None
+    if time_candidates:
+        best_col = max(time_candidates, key=lambda c: parse_success.get(c, 0.0))
+        if parse_success.get(best_col, 0.0) < 0.5:
+            best_col = None
+    if best_col is None:
+        # choose any column with high parse fraction
+        best_col = max(parse_success, key=parse_success.get) if parse_success else None
+        if best_col and parse_success.get(best_col, 0.0) < 0.5:
+            best_col = None
+
+    if best_col:
+        t = pd.to_datetime(df[best_col], errors="coerce")
+        df = df.drop(columns=[best_col])
+        df.index = t
+        df = df[~df.index.isna()]
+        df = df.sort_index()
+    else:
+        # no time column → integer index
+        df.index = pd.RangeIndex(start=0, stop=len(df), step=1)
+
+    # keep only numeric
+    num_df = df.select_dtypes(include=[np.number]).copy()
+    # drop zero-variance cols
+    nunique = num_df.nunique(dropna=False)
+    keep_cols = [c for c in num_df.columns if nunique[c] > 1]
+    num_df = num_df[keep_cols]
+    if num_df.shape[1] == 0:
+        raise ValueError("No numeric columns found in CSV.")
+    return num_df
+
+
+def infer_freq(index: pd.Index) -> Tuple[str, int]:
+    """Return ('time', seconds_per_step) for DatetimeIndex; ('step', 1) otherwise."""
+    if isinstance(index, pd.DatetimeIndex):
+        try:
+            inferred = pd.infer_freq(index)
+        except Exception:
+            inferred = None
+        if inferred is None and len(index) > 1:
+            delta = np.median(np.diff(index.view("int64")))  # ns
+            seconds = int(round(delta / 1e9)) if delta > 0 else 1
+            return ("time", max(1, seconds))
+        return ("time", 1)
+    return ("step", 1)
+
+
+# ------------------------------
+# Scaling
+# ------------------------------
+def fit_scaler(X: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
+    stats = {}
+    for c in X.columns:
+        mu = float(np.nanmean(X[c].values))
+        sd = float(np.nanstd(X[c].values) + 1e-12)
+        stats[c] = (mu, sd)
+    return stats
+
+
+def apply_scaler(X: pd.DataFrame, stats: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
+    Z = X.copy()
+    for c, (mu, sd) in stats.items():
+        if c in Z.columns:
+            Z[c] = (Z[c] - mu) / sd
+    return Z
+
+
+def invert_scaler(Z: pd.DataFrame, stats: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
+    X = Z.copy()
+    for c, (mu, sd) in stats.items():
+        if c in X.columns:
+            X[c] = X[c] * sd + mu
+    return X
+
+
+# ------------------------------
+# Dataset builder (sliding window)
+# ------------------------------
+def build_sequences(Z: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Z: (N, D) standardized
+    returns X: (N-seq_len, seq_len, D), Y: (N-seq_len, D)
+    """
+    N, D = Z.shape
+    if N <= seq_len:
+        raise ValueError(f"Not enough rows ({N}) for sequence length {seq_len}.")
+    X = np.zeros((N - seq_len, seq_len, D), dtype=np.float32)
+    Y = np.zeros((N - seq_len, D), dtype=np.float32)
+    for i in range(N - seq_len):
+        X[i] = Z[i:i+seq_len]
+        Y[i] = Z[i+seq_len]
+    return X, Y
+
+
+# ------------------------------
+# Models: Torch LSTM or NumPy MLP
+# ------------------------------
+class LSTMModel(nn.Module):
+    def __init__(self, n_features: int, hidden: int = 64):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, hidden, batch_first=True)
+        self.fc = nn.Linear(hidden, n_features)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
+        return self.fc(last)
+
+
+class NumpyMLP:
+    """Simple multi-output MLP fallback: input=seq_len*D, output=D"""
+    def __init__(self, in_dim: int, out_dim: int, hidden: int = 64, lr: float = 1e-3):
+        self.W1 = RNG.normal(0, 0.1, (in_dim, hidden))
+        self.b1 = np.zeros((hidden,))
+        self.W2 = RNG.normal(0, 0.1, (hidden, out_dim))
+        self.b2 = np.zeros((out_dim,))
+        self.lr = lr
+
+    @staticmethod
+    def relu(x): return np.maximum(0, x)
+
+    def fit(self, X: np.ndarray, Y: np.ndarray, epochs: int = 200, verbose: bool = True):
+        for ep in range(epochs):
+            H = self.relu(X @ self.W1 + self.b1)
+            Yp = H @ self.W2 + self.b2
+            err = Yp - Y
+            loss = np.mean(err**2)
+            # grads
+            dY = 2 * err / len(Y)
+            dW2 = H.T @ dY
+            db2 = dY.sum(axis=0)
+            dH = dY @ self.W2.T
+            dH[H <= 0] = 0
+            dW1 = X.T @ dH
+            db1 = dH.sum(axis=0)
+            # update
+            self.W2 -= self.lr * dW2
+            self.b2 -= self.lr * db2
+            self.W1 -= self.lr * dW1
+            self.b1 -= self.lr * db1
+            if verbose and ep % 50 == 0:
+                print(f"[NumPyMLP] epoch {ep:03d} loss={loss:.6f}")
+        return loss
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        H = self.relu(X @ self.W1 + self.b1)
+        return H @ self.W2 + self.b2
+
+    def save(self, path_npz: str):
+        np.savez(path_npz, W1=self.W1, b1=self.b1, W2=self.W2, b2=self.b2, lr=self.lr)
+
+    @staticmethod
+    def load(path_npz: str) -> "NumpyMLP":
+        data = np.load(path_npz, allow_pickle=True)
+        model = NumpyMLP(1,1)  # dummy init; will be overwritten
+        model.W1 = data["W1"]
+        model.b1 = data["b1"]
+        model.W2 = data["W2"]
+        model.b2 = data["b2"]
+        model.lr = float(data["lr"])
+        return model
+
+
+# ------------------------------
+# Training + Forecast
+# ------------------------------
+def train_and_forecast(df: pd.DataFrame,
+                       seq_len: int,
+                       horizon: int,
+                       epochs: int,
+                       outdir: Path,
+                       retrain: bool = True) -> Tuple[pd.DataFrame, Dict]:
+    outdir.mkdir(parents=True, exist_ok=True)
+    plots_dir = outdir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    # scale
+    scaler = fit_scaler(df)
+    with open(outdir / "scaler.json", "w", encoding="utf-8") as f:
+        json.dump({k: {"mean": v[0], "std": v[1]} for k,v in scaler.items()}, f, indent=2)
+    Z = apply_scaler(df, scaler).values.astype(np.float32)
+
+    # sequences
+    X, Y = build_sequences(Z, seq_len)
+    # split
+    n = len(X)
+    n_val = max(1, int(0.1 * n))
+    X_tr, Y_tr = X[:-n_val], Y[:-n_val]
+    X_va, Y_va = X[-n_val:], Y[-n_val:]
+
+    history = {"train_loss": [], "val_loss": []}
+
+    if TORCH_AVAILABLE:
+        device = "cpu"
+        model = LSTMModel(df.shape[1], hidden=64).to(device)
+        opt = optim.Adam(model.parameters(), lr=1e-3)
+        loss_fn = nn.MSELoss()
+
+        Xtr = torch.tensor(X_tr, dtype=torch.float32).to(device)
+        Ytr = torch.tensor(Y_tr, dtype=torch.float32).to(device)
+        Xva = torch.tensor(X_va, dtype=torch.float32).to(device)
+        Yva = torch.tensor(Y_va, dtype=torch.float32).to(device)
+
+        best_val = np.inf
+        patience, wait = 20, 0
+        for ep in range(epochs):
+            model.train()
+            opt.zero_grad()
+            pred = model(Xtr)
+            loss = loss_fn(pred, Ytr)
+            loss.backward()
+            opt.step()
+
+            model.eval()
+            with torch.no_grad():
+                val = loss_fn(model(Xva), Yva).item()
+
+            history["train_loss"].append(float(loss.item()))
+            history["val_loss"].append(float(val))
+            if ep % 10 == 0:
+                print(f"[Torch] epoch {ep:03d} train={loss.item():.6f} val={val:.6f}")
+
+            if val < best_val - 1e-6:
+                best_val = val
+                wait = 0
+                torch.save(model.state_dict(), outdir / "ciq_ai_model.pt")
+            else:
+                wait += 1
+                if wait >= patience:
+                    print("[Torch] Early stopping.")
+                    break
+
+        # load best
+        model.load_state_dict(torch.load(outdir / "ciq_ai_model.pt", map_location="cpu"))
+        model.eval()
+
+        # recursive multi-step forecast
+        seq = torch.tensor(Z[-seq_len:], dtype=torch.float32)[None, ...]
+        preds = []
+        for _ in range(horizon):
+            with torch.no_grad():
+                yhat = model(seq).cpu().numpy()[0]
+            preds.append(yhat)
+            yhat3d = yhat.reshape(1,1,-1)
+            seq = torch.cat([seq[:,1:,:], torch.tensor(yhat3d, dtype=torch.float32)], dim=1)
+
+        preds = np.array(preds)  # (H, D)
+    else:
+        print("[INFO] torch nicht gefunden -> NumPy-MLP Fallback.")
+        in_dim = X_tr.shape[1]*X_tr.shape[2]
+        out_dim = Y_tr.shape[1]
+        model_path = outdir / "ciq_ai_model.npz"
+
+        if retrain or not model_path.exists():
+            mlp = NumpyMLP(in_dim, out_dim, hidden=128, lr=1e-3)
+            last_loss = mlp.fit(X_tr.reshape(len(X_tr), -1), Y_tr, epochs=epochs, verbose=True)
+            mlp.save(str(model_path))
+            history["train_loss"].append(float(last_loss))
+            history["val_loss"].append(float(np.mean((mlp.predict(X_va.reshape(len(X_va), -1)) - Y_va)**2)))
+        else:
+            mlp = NumpyMLP.load(str(model_path))
+
+        # forecast
+        seq = Z[-seq_len:].copy()
+        preds = []
+        for _ in range(horizon):
+            pred = mlp.predict(seq.reshape(1,-1))[0]
+            preds.append(pred)
+            seq = np.vstack([seq[1:], pred])
+        preds = np.array(preds)
+
+    # denormalize
+    cols = list(df.columns)
+    df_pred = pd.DataFrame(preds, columns=cols)
+    df_pred = invert_scaler(df_pred, scaler)
+
+    # build forecast index
+    idx_kind, step_sec = infer_freq(df.index)
+    if idx_kind == "time" and isinstance(df.index, pd.DatetimeIndex):
+        # try to keep freq daily if unknown
+        start = df.index[-1] + pd.Timedelta(seconds=step_sec or 86400)
+        index = pd.date_range(start=start, periods=horizon, freq=f"{max(step_sec,1)}S")
+    else:
+        start = (df.index[-1] if len(df.index) else -1) + 1
+        index = pd.RangeIndex(start=start, stop=start+horizon, step=1)
+    df_pred.index = index
+
+    # save forecast
+    df_pred.to_csv(outdir / "forecast.csv", index_label="index")
+
+    # plots per column
+    for c in cols:
+        plt.figure(figsize=(10,5))
+        plt.plot(df.index, df[c].values, label="history")
+        plt.plot(df_pred.index, df_pred[c].values, label="forecast", linestyle="--")
+        plt.legend()
+        plt.title(f"Forecast for {c}")
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"forecast_{c}.png")
+        plt.close()
+
+    # save log
+    with open(outdir / "ciq_ai_log.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+    return df_pred, history
+
+
+# ------------------------------
+# Δ≈0.7 Feedback (optional if columns available)
+# ------------------------------
+def delta_feedback(df_hist: pd.DataFrame, df_fore: pd.DataFrame, outdir: Path) -> Optional[Dict]:
+    if "phi_super" in df_hist.columns and "phi_orch" in df_hist.columns:
+        diff = (df_hist["phi_super"] - df_hist["phi_orch"]).values
+        sigma = float(np.std(diff) + 1e-12)
+        delta_eff = float(abs(diff[-1]) / sigma) if len(diff) else 0.0
+        target = 0.7
+        error = target - delta_eff
+        # simple proportional suggestions (small gains)
+        adjust_r = 0.05 * error
+        adjust_gamma = -0.05 * error
+        fb = {
+            "delta_eff_last": delta_eff,
+            "target": target,
+            "error": error,
+            "suggest_adjust_r": adjust_r,
+            "suggest_adjust_gamma": adjust_gamma
+        }
+        with open(outdir / "feedback.json", "w", encoding="utf-8") as f:
+            json.dump(fb, f, indent=2)
+        return fb
+    else:
+        # nothing to do
+        return None
+
+
+# ------------------------------
+# CLI
+# ------------------------------
+def main():
+    p = argparse.ArgumentParser(description="CIQ v266+ AI Core (CSV, self-learning, multi-output)")
+    p.add_argument("--csv", type=str, required=True, help="Pfad zur Simulation-CSV (beliebige Spalten; AI wählt numerische automatisch)")
+    p.add_argument("--seq_len", type=int, default=64, help="Sequenzlänge (Vergangenheitsschritte)")
+    p.add_argument("--horizon", type=int, default=60, help="Vorhersageschritte")
+    p.add_argument("--epochs", type=int, default=150, help="Trainings-Epochen")
+    p.add_argument("--outdir", type=str, default="ai_out", help="Ausgabe-Verzeichnis")
+    p.add_argument("--retrain", action="store_true", help="Neu trainieren, auch wenn Gewichte existieren (NumPy-Fallback)")
+    args = p.parse_args()
+
+    outdir = Path(args.outdir)
+    df = load_csv_auto(args.csv)
+    print(f"[INFO] Loaded CSV with shape={df.shape}, columns={list(df.columns)}")
+
+    # train + forecast
+    df_pred, history = train_and_forecast(df, seq_len=args.seq_len, horizon=args.horizon, epochs=args.epochs, outdir=outdir, retrain=args.retrain)
+
+    # delta feedback (optional)
+    fb = delta_feedback(df, df_pred, outdir)
+
+    # brief stdout summary
+    print("[DONE] Forecast saved to:", outdir / "forecast.csv")
+    if fb:
+        print("[INFO] Δ≈0.7 feedback written to:", outdir / "feedback.json")
+
+if __name__ == "__main__":
+    main()
